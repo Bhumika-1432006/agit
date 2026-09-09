@@ -3,6 +3,7 @@
 
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { homedir } from "node:os";
 import { createInterface } from "node:readline/promises";
 import { claudeCodeAdapter } from "./adapters/claude-code.js";
 import { codexAdapter } from "./adapters/codex.js";
@@ -14,6 +15,7 @@ import { SCHEMA_VERSION, type AgitEvent, type SessionMeta } from "./format/event
 import { writeFork } from "./fork.js";
 import { renderSessionHtml } from "./html.js";
 import { diffSessions, renderDiff, treeOnDisk } from "./diff.js";
+import { discoverSessionLogs, parseSince } from "./discover.js";
 import { buildMatcher, grepEvents, GrepPatternError, renderHit } from "./grep.js";
 import { mergeFork, readForkInfo } from "./merge.js";
 import { redactDeep, type RedactionCounts } from "./redact.js";
@@ -52,6 +54,9 @@ const USAGE = `agit — git for running agents
 usage:
   agit import <session | bundle>       ingest a native session into .agit/, or
                                        adopt an agit log or pr bundle as-is
+  agit import --all [--since 7d]       find every session the supported runtimes
+                                       have written and import what is new
+  agit import --latest                 import the most recently written session
   agit ls                              list imported sessions
   agit show <id> [--by-model]          summarize one session; --by-model splits
                                        cost and file edits per model
@@ -85,6 +90,7 @@ options:
   --out <dir>      fork/pr: where to write the fork or bundle
   --into <dir>     merge: target directory (default: current directory)
   --summary <txt>  merge: what the fork learned, recorded in merge.json
+  --since <dur>    import --all: only logs modified within 7d / 24h / 30m
   --type <t>       grep: only this event type (tool.call, file.diff, ...)
   --path           grep: match file.diff paths instead of rendered lines
   --regex          grep: treat the pattern as a regular expression
@@ -104,6 +110,9 @@ interface Opts {
   timeline: boolean;
   state: boolean;
   byModel: boolean;
+  all: boolean;
+  latest: boolean;
+  since?: number;
   json: boolean;
   grepType?: string;
   grepPath: boolean;
@@ -128,6 +137,8 @@ function parseArgs(argv: string[]): { verb: string; opts: Opts } {
     timeline: false,
     state: false,
     byModel: false,
+    all: false,
+    latest: false,
     json: false,
     grepPath: false,
     grepRegex: false,
@@ -146,7 +157,16 @@ function parseArgs(argv: string[]): { verb: string; opts: Opts } {
     else if (a === "--timeline") opts.timeline = true;
     else if (a === "--state") opts.state = true;
     else if (a === "--by-model") opts.byModel = true;
-    else if (a === "--type") opts.grepType = argv[++i];
+    else if (a === "--all") opts.all = true;
+    else if (a === "--latest") opts.latest = true;
+    else if (a === "--since") {
+      const ms = parseSince(argv[++i] ?? "");
+      if (ms === null) {
+        console.error("--since takes a duration like 7d, 24h or 30m");
+        process.exit(2);
+      }
+      opts.since = ms;
+    } else if (a === "--type") opts.grepType = argv[++i];
     else if (a === "--path") opts.grepPath = true;
     else if (a === "--regex") opts.grepRegex = true;
     else if (a === "-s") opts.caseSensitive = true;
@@ -241,15 +261,168 @@ function looksLikeAgitLog(lines: string[]): boolean {
   );
 }
 
+/**
+ * The gate every verb that publishes or hands off a stored session goes
+ * through. A chain that does not recompute is refused outright, and the
+ * refusal says which check failed and at which event. Verification is the
+ * claim this tool makes; a silent pass-through here would be the one bug
+ * that undoes all of it.
+ */
+function refuseUnlessVerified(opts: Opts, id: string, verb: string, consequence: string): boolean {
+  const meta = readSessionMeta(opts.dir, id);
+  const check = verifyChain(readSessionLines(opts.dir, id), meta ?? undefined);
+  if (check.ok) return true;
+  const why = check.firstBroken
+    ? `event ${check.firstBroken.seq}: ${check.firstBroken.reason}`
+    : "chain does not verify";
+  console.error(`refusing to ${verb}: chain verification failed — ${why}`);
+  console.error(
+    `  ${check.events} event${check.events === 1 ? "" : "s"} verified before the break; ${consequence}. Run: agit verify ${id.slice(0, 8)}`,
+  );
+  return false;
+}
+
+interface ImportOutcome {
+  status: "imported" | "updated" | "unchanged" | "unrecognized";
+  id?: string;
+  adapter?: Adapter;
+  events?: number;
+  previousEvents?: number;
+  records?: number;
+  skipped?: Record<string, number>;
+  redactions?: RedactionCounts;
+  headHash?: string;
+}
+
+/**
+ * sha256 of every stored session's source file: the cheap, exact way to know
+ * a log is already in the store. Import is deterministic, so a matching hash
+ * means byte-identical output and nothing to do.
+ */
+function knownSources(dir: string): Map<string, string> {
+  const known = new Map<string, string>();
+  for (const id of listSessionIds(dir)) {
+    const meta = readSessionMeta(dir, id);
+    if (meta?.source?.sha256) known.set(meta.source.sha256, id);
+  }
+  return known;
+}
+
+/** Convert one native log into the store. Prints nothing; callers decide how much to say. */
+function importNativeLog(
+  opts: Opts,
+  path: string,
+  raw: string,
+  lines: string[],
+  known: Map<string, string>,
+): ImportOutcome {
+  const sha256 = sha256Hex(raw);
+  const knownId = known.get(sha256);
+  if (knownId !== undefined) return { status: "unchanged", id: knownId };
+
+  const adapter = ADAPTERS.find((a) => a.detect(lines));
+  if (!adapter) return { status: "unrecognized" };
+
+  const converted = adapter.convert(lines);
+  const redactions: RedactionCounts = {};
+  for (const d of converted.drafts) d.payload = redactDeep(d.payload, redactions);
+  const events = buildChain(converted.sessionId, converted.drafts);
+  // Same id already stored means the source grew (a resumed session) or changed.
+  const previous = listSessionIds(opts.dir).includes(converted.sessionId)
+    ? readSessionMeta(opts.dir, converted.sessionId)
+    : null;
+
+  const meta: SessionMeta = {
+    agitSchema: 1,
+    sessionId: converted.sessionId,
+    adapter: { name: adapter.name, version: adapter.version },
+    importedAt: new Date().toISOString(),
+    source: { path, sha256, bytes: statSync(path).size, records: converted.records },
+    skipped: converted.skipped,
+    redactions,
+    eventCount: events.length,
+    headHash: events[events.length - 1]!.hash,
+  };
+  writeSession(opts.dir, converted.sessionId, toJsonl(events), meta);
+  known.set(sha256, converted.sessionId);
+  return {
+    status: previous ? "updated" : "imported",
+    id: converted.sessionId,
+    adapter,
+    events: events.length,
+    previousEvents: previous?.eventCount,
+    records: converted.records,
+    skipped: converted.skipped,
+    redactions,
+    headHash: meta.headHash,
+  };
+}
+
+/** The full report for one import — what `agit import <file>` has always printed. */
+function printImportReport(opts: Opts, outcome: ImportOutcome): number {
+  if (outcome.status === "unrecognized") {
+    console.error(
+      "no adapter recognizes this file (adapters available: " + ADAPTERS.map((a) => a.name).join(", ") + ")",
+    );
+    return 1;
+  }
+  if (outcome.status === "unchanged") {
+    console.log(`unchanged ${outcome.id} — already imported from this file; nothing to do`);
+    return 0;
+  }
+  const id = outcome.id!;
+  const adapter = outcome.adapter!;
+  const skipped = outcome.skipped ?? {};
+  const redactions = outcome.redactions ?? {};
+  console.log(`${outcome.status} ${id}`);
+  console.log(`  adapter     ${adapter.name}@${adapter.version}`);
+  console.log(
+    outcome.status === "updated"
+      ? `  events      ${outcome.previousEvents} → ${outcome.events} (from ${outcome.records} native records)`
+      : `  events      ${outcome.events} (from ${outcome.records} native records)`,
+  );
+  const skippedTotal = Object.values(skipped).reduce((a, b) => a + b, 0);
+  if (skippedTotal > 0) {
+    const detail = Object.entries(skipped)
+      .sort((a, b) => b[1] - a[1])
+      .map(([k, v]) => `${k}×${v}`)
+      .join(", ");
+    console.log(`  skipped     ${skippedTotal} native records with no mapping: ${detail}`);
+  }
+  const redactedTotal = Object.values(redactions).reduce((a, b) => a + b, 0);
+  console.log(
+    redactedTotal > 0
+      ? `  redacted    ${redactedTotal}: ${Object.entries(redactions)
+          .map(([k, v]) => `${k}×${v}`)
+          .join(", ")}`
+      : `  redacted    nothing matched the credential patterns (SPEC §8 — a seatbelt, not a guarantee)`,
+  );
+  console.log(`  head        ${outcome.headHash!.slice(0, 12)}`);
+  console.log(`  wrote       ${sessionDir(opts.dir, id)}`);
+  return 0;
+}
+
 function cmdImport(opts: Opts): number {
+  if (opts.all || opts.latest || opts.since !== undefined) return cmdImportDiscovered(opts);
   const src = opts.args[0];
   if (!src) {
-    console.error("usage: agit import <native-session.jsonl | agit-bundle>");
+    console.error(
+      "usage: agit import <native-session.jsonl | agit-bundle>   |   agit import --all | --latest",
+    );
     return 2;
   }
+  return importPath(opts, resolve(src));
+}
+
+/** One path: a pr bundle directory, an agit log, or a native session log. */
+function importPath(opts: Opts, target: string): number {
+  let path = target;
+  if (!existsSync(path)) {
+    console.error(`no such file: ${path}`);
+    return 1;
+  }
   // `agit pr` writes a directory; accept it as directly as a file.
-  let path = resolve(src);
-  if (existsSync(path) && statSync(path).isDirectory()) {
+  if (statSync(path).isDirectory()) {
     const inner = join(path, "events.jsonl");
     if (!existsSync(inner)) {
       console.error(`${path} is a directory with no events.jsonl in it`);
@@ -265,55 +438,102 @@ function cmdImport(opts: Opts): number {
   // rewrite a log this path promises to store byte for byte.
   if (looksLikeAgitLog(lines)) return adoptBundle(opts, path, raw);
 
-  const adapter = ADAPTERS.find((a) => a.detect(lines));
-  if (!adapter) {
+  return printImportReport(opts, importNativeLog(opts, path, raw, lines, knownSources(opts.dir)));
+}
+
+function ago(mtimeMs: number): string {
+  const s = Math.max(0, Math.round((Date.now() - mtimeMs) / 1000));
+  if (s < 90) return `${s}s ago`;
+  const m = Math.round(s / 60);
+  if (m < 90) return `${m} min ago`;
+  const h = Math.round(m / 60);
+  if (h < 36) return `${h}h ago`;
+  return `${Math.round(h / 24)}d ago`;
+}
+
+/**
+ * `agit import --all` / `--latest`: find the supported runtimes' logs where
+ * they write them and import what is new. A directory listing plus the
+ * ordinary import — no daemon, no hooks. Retroactive by default: a log from
+ * months ago is found the same way as one from a minute ago.
+ */
+function cmdImportDiscovered(opts: Opts): number {
+  const { logs, roots } = discoverSessionLogs(homedir());
+  console.log("scanned");
+  for (const r of roots) {
+    const found = r.exists ? `${r.found} log${r.found === 1 ? "" : "s"}` : "not found";
+    console.log(`  ${r.runtime.padEnd(12)} ${r.dir}  (${found})`);
+  }
+  if (logs.length === 0) {
     console.error(
-      "no adapter recognizes this file (adapters available: " + ADAPTERS.map((a) => a.name).join(", ") + ")",
+      "\nno session logs found in any of those directories — is a supported runtime installed here?",
     );
     return 1;
   }
-
-  const converted = adapter.convert(lines);
-  const redactions: RedactionCounts = {};
-  for (const d of converted.drafts) d.payload = redactDeep(d.payload, redactions);
-  const events = buildChain(converted.sessionId, converted.drafts);
-  const jsonl = toJsonl(events);
-
-  const meta: SessionMeta = {
-    agitSchema: 1,
-    sessionId: converted.sessionId,
-    adapter: { name: adapter.name, version: adapter.version },
-    importedAt: new Date().toISOString(),
-    source: { path, sha256: sha256Hex(raw), bytes: statSync(path).size, records: converted.records },
-    skipped: converted.skipped,
-    redactions,
-    eventCount: events.length,
-    headHash: events[events.length - 1]!.hash,
-  };
-  writeSession(opts.dir, converted.sessionId, jsonl, meta);
-
-  console.log(`imported ${converted.sessionId}`);
-  console.log(`  adapter     ${adapter.name}@${adapter.version}`);
-  console.log(`  events      ${events.length} (from ${converted.records} native records)`);
-  const skippedTotal = Object.values(converted.skipped).reduce((a, b) => a + b, 0);
-  if (skippedTotal > 0) {
-    const detail = Object.entries(converted.skipped)
-      .sort((a, b) => b[1] - a[1])
-      .map(([k, v]) => `${k}×${v}`)
-      .join(", ");
-    console.log(`  skipped     ${skippedTotal} native records with no mapping: ${detail}`);
+  const cutoff = opts.since !== undefined ? Date.now() - opts.since : null;
+  const candidates = cutoff === null ? logs : logs.filter((l) => l.mtimeMs >= cutoff);
+  if (candidates.length === 0) {
+    console.log(
+      `\nnothing modified within the --since window (${logs.length} older log${logs.length === 1 ? "" : "s"} left alone)`,
+    );
+    return 0;
   }
-  const redactedTotal = Object.values(redactions).reduce((a, b) => a + b, 0);
+
+  if (opts.latest) {
+    // Newest first, skipping anything no adapter claims — a runtime's
+    // directory holds more than session logs — so "latest" means the latest
+    // session, not the newest file.
+    for (let i = candidates.length - 1; i >= 0; i--) {
+      const log = candidates[i]!;
+      const lines = readNativeLog(log.path)
+        .split("\n")
+        .filter((l) => l.trim() !== "");
+      if (!ADAPTERS.some((a) => a.detect(lines))) {
+        console.log(`  skipped    ${log.path}: no adapter recognizes this file`);
+        continue;
+      }
+      console.log(`\nlatest: ${log.path}  (${log.runtime}, modified ${ago(log.mtimeMs)})\n`);
+      return importPath(opts, log.path);
+    }
+    console.error("\nnone of the logs found is recognized by an adapter");
+    return 1;
+  }
+
+  const known = knownSources(opts.dir);
+  const tally = { imported: 0, updated: 0, unchanged: 0, unrecognized: 0, failed: 0 };
+  console.log("");
+  for (const log of candidates) {
+    let outcome: ImportOutcome;
+    try {
+      const raw = readNativeLog(log.path);
+      const lines = raw.split("\n").filter((l) => l.trim() !== "");
+      outcome = looksLikeAgitLog(lines)
+        ? { status: "unrecognized" }
+        : importNativeLog(opts, log.path, raw, lines, known);
+    } catch (err) {
+      tally.failed++;
+      console.log(`  failed     ${log.path}: ${err instanceof Error ? err.message : String(err)}`);
+      continue;
+    }
+    tally[outcome.status]++;
+    const id = (outcome.id ?? "").slice(0, 20).padEnd(20);
+    if (outcome.status === "imported") {
+      console.log(
+        `  imported   ${id} ${log.runtime.padEnd(12)} ${String(outcome.events).padStart(6)} events   ${log.path}`,
+      );
+    } else if (outcome.status === "updated") {
+      console.log(
+        `  updated    ${id} ${log.runtime.padEnd(12)} ${outcome.previousEvents} → ${outcome.events} events   ${log.path}`,
+      );
+    } else if (outcome.status === "unrecognized") {
+      console.log(`  skipped    ${log.path}: no adapter recognizes this file`);
+    }
+  }
+  const total = listSessionIds(opts.dir).length;
   console.log(
-    redactedTotal > 0
-      ? `  redacted    ${redactedTotal}: ${Object.entries(redactions)
-          .map(([k, v]) => `${k}×${v}`)
-          .join(", ")}`
-      : `  redacted    nothing matched the credential patterns (SPEC §8 — a seatbelt, not a guarantee)`,
+    `\n${tally.imported} imported, ${tally.updated} updated, ${tally.unchanged} unchanged, ${tally.unrecognized} skipped, ${tally.failed} failed — ${total} session${total === 1 ? "" : "s"} in ${join(opts.dir, ".agit")}`,
   );
-  console.log(`  head        ${meta.headHash.slice(0, 12)}`);
-  console.log(`  wrote       ${sessionDir(opts.dir, converted.sessionId)}`);
-  return 0;
+  return tally.failed > 0 ? 1 : 0;
 }
 
 /**
@@ -647,14 +867,7 @@ function cmdFork(opts: Opts): number {
     return 2;
   }
   // Never fork an unverified prefix: the fork point hash is a provenance claim.
-  const check = verifyChain(readSessionLines(opts.dir, id));
-  if (!check.ok) {
-    const why = check.firstBroken
-      ? `event ${check.firstBroken.seq}: ${check.firstBroken.reason}`
-      : "broken chain";
-    console.error(`refusing to fork: chain verification failed — ${why}`);
-    return 1;
-  }
+  if (!refuseUnlessVerified(opts, id, "fork", "nothing was written")) return 1;
 
   const outDir = resolve(opts.out ?? `agit-fork-${id.slice(0, 8)}-at${opts.at}`);
   if (existsSync(outDir)) {
@@ -805,11 +1018,7 @@ function cmdPr(opts: Opts): number {
     console.error(`--at ${String(opts.at)} is outside this session (0..${events.length - 1})`);
     return 2;
   }
-  const check = verifyChain(readSessionLines(opts.dir, id));
-  if (!check.ok) {
-    console.error("refusing to hand off an unverifiable session (agit verify it first)");
-    return 1;
-  }
+  if (!refuseUnlessVerified(opts, id, "hand off", "nothing was written")) return 1;
   const outDir = resolve(opts.out ?? `agit-pr-${id.slice(0, 8)}`);
   if (existsSync(outDir)) {
     console.error(`refusing to write into existing ${outDir} — pass a fresh --out`);
@@ -894,6 +1103,7 @@ function cmdGrep(opts: Opts): number {
 
 function cmdExport(opts: Opts): number {
   const id = requireId(opts);
+  if (!refuseUnlessVerified(opts, id, "export", "nothing was written")) return 1;
   if (opts.json) {
     process.stdout.write(JSON.stringify(readSessionEvents(opts.dir, id), null, 2) + "\n");
   } else {
@@ -905,19 +1115,8 @@ function cmdExport(opts: Opts): number {
 
 function cmdExportHtml(opts: Opts): number {
   const id = requireId(opts);
-  const lines = readSessionLines(opts.dir, id);
   const meta = readSessionMeta(opts.dir, id);
-  const check = verifyChain(
-    lines,
-    meta ? { eventCount: meta.eventCount, headHash: meta.headHash } : undefined,
-  );
-
-  if (!check.ok) {
-    console.error(
-      `refusing to export an unverifiable session: ${check.firstBroken?.reason ?? "invalid chain"}`,
-    );
-    return 1;
-  }
+  if (!refuseUnlessVerified(opts, id, "export", "nothing was written")) return 1;
 
   const events = readSessionEvents(opts.dir, id);
   const outPath = resolve(opts.out ?? `agit-${id.slice(0, 8)}.html`);
@@ -986,6 +1185,9 @@ async function cmdShare(opts: Opts): Promise<number> {
     if (!opts.static && meta && existsSync(meta.source.path)) {
       nativePath = meta.source.path;
     } else {
+      // This is the path that publishes the stored chain itself, so it is
+      // the one that must never publish a chain that does not verify.
+      if (!refuseUnlessVerified(opts, id, "share", "nothing was published")) return 1;
       staticEvents = readSessionEvents(opts.dir, id);
     }
   }
