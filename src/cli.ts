@@ -61,6 +61,8 @@ const USAGE = `agit — git for running agents
 usage:
   agit import <session | bundle>       ingest a native session into .agit/, or
                                        adopt an agit log or pr bundle as-is
+  agit import <session> --no-redact    skip credential scanning; share/pr later
+                                       refuse this session without --allow-unredacted
   agit import --all [--since 7d]       find every session the supported runtimes
                                        have written and import what is new
   agit import --latest                 import the most recently written session
@@ -100,6 +102,9 @@ options:
   --into <dir>     merge: target directory (default: current directory)
   --summary <txt>  merge: what the fork learned, recorded in merge.json
   --since <dur>    import --all: only logs modified within 7d / 24h / 30m
+  --no-redact      import: store the session verbatim, skipping credential
+                   scanning (SPEC §8) — meta.json remembers this
+  --allow-unredacted  share/pr: proceed anyway on a --no-redact session
   --type <t>       grep: only this event type (tool.call, file.diff, ...)
   --path           grep: match file.diff paths instead of rendered lines
   --regex          grep: treat the pattern as a regular expression
@@ -123,6 +128,8 @@ interface Opts {
   latest: boolean;
   since?: number;
   json: boolean;
+  noRedact: boolean;
+  allowUnredacted: boolean;
   grepType?: string;
   grepPath: boolean;
   grepRegex: boolean;
@@ -149,6 +156,8 @@ function parseArgs(argv: string[]): { verb: string; opts: Opts } {
     all: false,
     latest: false,
     json: false,
+    noRedact: false,
+    allowUnredacted: false,
     grepPath: false,
     grepRegex: false,
     caseSensitive: false,
@@ -184,6 +193,8 @@ function parseArgs(argv: string[]): { verb: string; opts: Opts } {
     else if (a === "--into") opts.into = argv[++i];
     else if (a === "--summary") opts.summary = argv[++i];
     else if (a === "--json") opts.json = true;
+    else if (a === "--no-redact") opts.noRedact = true;
+    else if (a === "--allow-unredacted") opts.allowUnredacted = true;
     else if (a === "--relay") opts.relay = argv[++i] ?? opts.relay;
     else if (a === "--ttl") opts.ttlHours = Number(argv[++i]);
     else if (a === "--static") opts.static = true;
@@ -292,6 +303,23 @@ function refuseUnlessVerified(opts: Opts, id: string, verb: string, consequence:
   return false;
 }
 
+/**
+ * The gate every verb that hands a stored session's raw content to someone
+ * else goes through. `agit import --no-redact` is opt-in and explicit at
+ * import time; `share`/`pr` must be equally explicit before they publish or
+ * bundle a session that was never scanned for credentials.
+ */
+function refuseUnlessRedacted(opts: Opts, id: string, verb: string): boolean {
+  if (opts.allowUnredacted) return true;
+  const meta = readSessionMeta(opts.dir, id);
+  if (!meta?.redactionSkipped) return true;
+  console.error(
+    `refusing to ${verb} ${id.slice(0, 8)}: imported with --no-redact, so it was never scanned for credentials.`,
+  );
+  console.error("  pass --allow-unredacted if you have already checked its contents yourself.");
+  return false;
+}
+
 interface ImportOutcome {
   status: "imported" | "updated" | "unchanged" | "unrecognized";
   id?: string;
@@ -335,7 +363,9 @@ function importNativeLog(
 
   const converted = adapter.convert(lines);
   const redactions: RedactionCounts = {};
-  for (const d of converted.drafts) d.payload = redactDeep(d.payload, redactions);
+  if (!opts.noRedact) {
+    for (const d of converted.drafts) d.payload = redactDeep(d.payload, redactions);
+  }
   const events = buildChain(converted.sessionId, converted.drafts);
   // Same id already stored means the source grew (a resumed session) or changed.
   const previous = listSessionIds(opts.dir).includes(converted.sessionId)
@@ -352,6 +382,7 @@ function importNativeLog(
     redactions,
     eventCount: events.length,
     headHash: events[events.length - 1]!.hash,
+    ...(opts.noRedact ? { redactionSkipped: true as const } : {}),
   };
   writeSession(opts.dir, converted.sessionId, toJsonl(events), meta);
   known.set(sha256, converted.sessionId);
@@ -401,11 +432,13 @@ function printImportReport(opts: Opts, outcome: ImportOutcome): number {
   }
   const redactedTotal = Object.values(redactions).reduce((a, b) => a + b, 0);
   console.log(
-    redactedTotal > 0
-      ? `  redacted    ${redactedTotal}: ${Object.entries(redactions)
-          .map(([k, v]) => `${k}×${v}`)
-          .join(", ")}`
-      : `  redacted    nothing matched the credential patterns (SPEC §8 — a seatbelt, not a guarantee)`,
+    opts.noRedact
+      ? "  redacted    SKIPPED (--no-redact) — stored verbatim; share/pr refuse this session without --allow-unredacted"
+      : redactedTotal > 0
+        ? `  redacted    ${redactedTotal}: ${Object.entries(redactions)
+            .map(([k, v]) => `${k}×${v}`)
+            .join(", ")}`
+        : `  redacted    nothing matched the credential patterns (SPEC §8 — a seatbelt, not a guarantee)`,
   );
   console.log(`  head        ${outcome.headHash!.slice(0, 12)}`);
   console.log(`  wrote       ${sessionDir(opts.dir, id)}`);
@@ -750,7 +783,9 @@ function cmdShow(opts: Opts): number {
       );
     }
   }
-  if (meta && Object.keys(meta.redactions).length > 0) {
+  if (meta?.redactionSkipped) {
+    console.log("  redactions  SKIPPED at import (--no-redact) — share/pr need --allow-unredacted");
+  } else if (meta && Object.keys(meta.redactions).length > 0) {
     console.log(
       `  redactions  ${Object.entries(meta.redactions)
         .map(([k, v]) => `${k}×${v}`)
@@ -1046,6 +1081,7 @@ function cmdPr(opts: Opts): number {
     return 2;
   }
   if (!refuseUnlessVerified(opts, id, "hand off", "nothing was written")) return 1;
+  if (!refuseUnlessRedacted(opts, id, "hand off")) return 1;
   const outDir = resolve(opts.out ?? `agit-pr-${id.slice(0, 8)}`);
   if (existsSync(outDir)) {
     console.error(`refusing to write into existing ${outDir} — pass a fresh --out`);
@@ -1234,8 +1270,10 @@ async function cmdShare(opts: Opts): Promise<number> {
       nativePath = meta.source.path;
     } else {
       // This is the path that publishes the stored chain itself, so it is
-      // the one that must never publish a chain that does not verify.
+      // the one that must never publish a chain that does not verify — or
+      // one that was imported with --no-redact and never scanned.
       if (!refuseUnlessVerified(opts, id, "share", "nothing was published")) return 1;
+      if (!refuseUnlessRedacted(opts, id, "share")) return 1;
       staticEvents = readSessionEvents(opts.dir, id);
     }
   }
