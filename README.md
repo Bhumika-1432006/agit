@@ -1,6 +1,6 @@
 # agit — git for running agents
 
-[![ci](https://github.com/thegoodengineers/agit/actions/workflows/ci.yml/badge.svg)](https://github.com/thegoodengineers/agit/actions/workflows/ci.yml)
+[![ci](https://github.com/agitHQ/agit/actions/workflows/ci.yml/badge.svg)](https://github.com/agitHQ/agit/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/agitsh)](https://www.npmjs.com/package/agitsh)
 
 An AI coding session is trapped: one terminal, one machine, a proprietary log
@@ -31,7 +31,7 @@ npm install -g agitsh
 Or, for contributors, from source:
 
 ```
-git clone https://github.com/thegoodengineers/agit && cd agit
+git clone https://github.com/agitHQ/agit && cd agit
 npm ci && npm run build && npm link   # `agit` is now on your PATH
 ```
 
