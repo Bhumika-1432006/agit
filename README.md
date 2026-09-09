@@ -130,7 +130,7 @@ fall out of that chain.
 
 Said plainly:
 
-- **Two adapters, with different limits.** Claude Code is the reference;
+- **Three adapters, with different limits.** Claude Code is the reference;
   Codex is mapped from its own structured edit records. OpenClaw is mapped from the `apply_patch` text it records, replayed
   with OpenClaw's own matching rules.
 - **Codex updates have a verification window.** Codex records a file's full
