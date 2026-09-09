@@ -153,6 +153,8 @@ describe("redaction (SPEC §8)", () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- deliberately off-spec input, same as JS callers can pass
     const input: any = { a: undefined, b: 1, c: [undefined, 2] };
     expect(redactDeep(input, counts)).toEqual({ b: 1, c: [undefined, 2] });
+  });
+
   it("assignment does not catastrophically backtrack on a long ordinary string", () => {
     // Regression for a real bug: the earlier `(?:[A-Za-z0-9]+[_-])*` prefix
     // had an unbounded inner `+` that backtracked the full remaining length
