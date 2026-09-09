@@ -39,6 +39,7 @@ import {
 } from "./share.js";
 import {
   assertSafeSessionId,
+  deleteSession,
   deleteShareState,
   listSessionIds,
   readSessionEvents,
@@ -65,6 +66,7 @@ usage:
                                        have written and import what is new
   agit import --latest                 import the most recently written session
   agit ls                              list imported sessions
+  agit rm <id> --yes                   permanently delete a session from the store
   agit show <id> [--by-model]          summarize one session; --by-model splits
                                        cost and file edits per model
   agit verify <id | events.jsonl>      validate the hash chain — of a stored
@@ -100,6 +102,7 @@ options:
   --into <dir>     merge: target directory (default: current directory)
   --summary <txt>  merge: what the fork learned, recorded in merge.json
   --since <dur>    import --all: only logs modified within 7d / 24h / 30m
+  --yes, -y        rm: confirm the deletion (there is no interactive prompt)
   --type <t>       grep: only this event type (tool.call, file.diff, ...)
   --path           grep: match file.diff paths instead of rendered lines
   --regex          grep: treat the pattern as a regular expression
@@ -123,6 +126,7 @@ interface Opts {
   latest: boolean;
   since?: number;
   json: boolean;
+  yes: boolean;
   grepType?: string;
   grepPath: boolean;
   grepRegex: boolean;
@@ -149,6 +153,7 @@ function parseArgs(argv: string[]): { verb: string; opts: Opts } {
     all: false,
     latest: false,
     json: false,
+    yes: false,
     grepPath: false,
     grepRegex: false,
     caseSensitive: false,
@@ -184,6 +189,7 @@ function parseArgs(argv: string[]): { verb: string; opts: Opts } {
     else if (a === "--into") opts.into = argv[++i];
     else if (a === "--summary") opts.summary = argv[++i];
     else if (a === "--json") opts.json = true;
+    else if (a === "--yes" || a === "-y") opts.yes = true;
     else if (a === "--relay") opts.relay = argv[++i] ?? opts.relay;
     else if (a === "--ttl") opts.ttlHours = Number(argv[++i]);
     else if (a === "--static") opts.static = true;
@@ -206,6 +212,8 @@ async function main(): Promise<number> {
       return cmdImport(opts);
     case "ls":
       return cmdLs(opts);
+    case "rm":
+      return cmdRm(opts);
     case "show":
       return cmdShow(opts);
     case "verify":
@@ -681,6 +689,39 @@ function cmdLs(opts: Opts): number {
   console.log(cols.map((c, i) => c.toUpperCase().padEnd(widths[i]!)).join("  "));
   for (const r of rows) console.log(cols.map((c, i) => r[c].padEnd(widths[i]!)).join("  "));
   console.log("(files = lower bound: structured edits only — shell-driven changes are not tracked)");
+  return 0;
+}
+
+/**
+ * Remove a session from the store (issue #71). Requires --yes: there is no
+ * interactive prompt to confirm against, so the flag itself is the
+ * confirmation, the same way `docker rm -f` or `kubectl delete` ask for an
+ * explicit flag rather than a y/n prompt a script can't answer.
+ *
+ * Does not check whether a fork elsewhere in the filesystem still points at
+ * this session (fork.json names its source by id) — forks live in whatever
+ * directory `--out` named, with no central registry agit could scan. That
+ * would need one; it does not exist yet, and this command does not guess
+ * at where forks might be.
+ */
+function cmdRm(opts: Opts): number {
+  const id = requireId(opts);
+  if (!opts.yes) {
+    // A session `rm` is likely to be pointed at is often the corrupt one
+    // ls already can't summarize — don't let that same corruption block
+    // deleting it.
+    let detail: string;
+    try {
+      detail = ` (${readSessionEvents(opts.dir, id).length} events)`;
+    } catch {
+      detail = " (unreadable/corrupt)";
+    }
+    console.error(`this will permanently delete session ${id}${detail} from the store.`);
+    console.error("pass --yes to confirm.");
+    return 2;
+  }
+  deleteSession(opts.dir, id);
+  console.log(`removed ${id}`);
   return 0;
 }
 
