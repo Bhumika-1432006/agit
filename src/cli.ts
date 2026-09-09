@@ -100,6 +100,9 @@ options:
   --into <dir>     merge: target directory (default: current directory)
   --summary <txt>  merge: what the fork learned, recorded in merge.json
   --since <dur>    import --all: only logs modified within 7d / 24h / 30m
+  --json           ls/show/verify/grep/diff/export: machine-readable output
+                   instead of the human-formatted default (grep: one JSON
+                   object per line, NDJSON; everything else: one document)
   --type <t>       grep: only this event type (tool.call, file.diff, ...)
   --path           grep: match file.diff paths instead of rendered lines
   --regex          grep: treat the pattern as a regular expression
@@ -637,6 +640,16 @@ function adoptBundle(opts: Opts, path: string, raw: string): number {
   return 0;
 }
 
+interface LsRow {
+  id: string;
+  corrupt: boolean;
+  started?: string;
+  durationMs?: number;
+  events?: number;
+  files?: number;
+  runtime?: string;
+}
+
 function cmdLs(opts: Opts): number {
   if (!existsSync(opts.dir)) {
     console.error(`no such directory: ${opts.dir}`);
@@ -644,42 +657,60 @@ function cmdLs(opts: Opts): number {
   }
   const ids = listSessionIds(opts.dir);
   if (ids.length === 0) {
-    console.log("no sessions imported yet (agit import <file>)");
+    if (opts.json) process.stdout.write("[]\n");
+    else console.log("no sessions imported yet (agit import <file>)");
     return 0;
   }
-  const rows = ids.map((id) => {
+  const rows: LsRow[] = ids.map((id) => {
     // One corrupt session must not take down the whole listing.
     let events;
     try {
       events = readSessionEvents(opts.dir, id);
       if (events.length === 0) throw new Error("empty log");
     } catch {
-      return {
-        id: id.slice(0, 8),
-        started: "(corrupt — run `agit verify " + id.slice(0, 8) + "`)",
-        dur: "",
-        events: "",
-        files: "",
-        runtime: "",
-      };
+      return { id, corrupt: true };
     }
     const first = events[0]!;
     const last = events[events.length - 1]!;
     const files = fileStateAt(events).size;
     const start = (first.payload as { runtime?: unknown }).runtime;
     return {
-      id: id.slice(0, 8),
-      started: first.ts.slice(0, 16).replace("T", " "),
-      dur: humanDuration(Date.parse(last.ts) - Date.parse(first.ts)),
-      events: String(events.length),
-      files: String(files),
+      id,
+      corrupt: false,
+      started: first.ts,
+      durationMs: Date.parse(last.ts) - Date.parse(first.ts),
+      events: events.length,
+      files,
       runtime: typeof start === "string" ? start : "?",
     };
   });
+  if (opts.json) {
+    process.stdout.write(JSON.stringify(rows, null, 2) + "\n");
+    return 0;
+  }
+  const displayRows = rows.map((r) =>
+    r.corrupt
+      ? {
+          id: r.id.slice(0, 8),
+          started: "(corrupt — run `agit verify " + r.id.slice(0, 8) + "`)",
+          dur: "",
+          events: "",
+          files: "",
+          runtime: "",
+        }
+      : {
+          id: r.id.slice(0, 8),
+          started: r.started!.slice(0, 16).replace("T", " "),
+          dur: humanDuration(r.durationMs!),
+          events: String(r.events),
+          files: String(r.files),
+          runtime: r.runtime!,
+        },
+  );
   const cols = ["id", "started", "dur", "events", "files", "runtime"] as const;
-  const widths = cols.map((c) => Math.max(c.length, ...rows.map((r) => r[c].length)));
+  const widths = cols.map((c) => Math.max(c.length, ...displayRows.map((r) => r[c].length)));
   console.log(cols.map((c, i) => c.toUpperCase().padEnd(widths[i]!)).join("  "));
-  for (const r of rows) console.log(cols.map((c, i) => r[c].padEnd(widths[i]!)).join("  "));
+  for (const r of displayRows) console.log(cols.map((c, i) => r[c].padEnd(widths[i]!)).join("  "));
   console.log("(files = lower bound: structured edits only — shell-driven changes are not tracked)");
   return 0;
 }
@@ -692,15 +723,6 @@ function cmdShow(opts: Opts): number {
   const last = events[events.length - 1]!;
   const start = first.payload as { [k: string]: unknown };
 
-  console.log(`session ${id}`);
-  console.log(`  runtime     ${start.runtime} ${start.runtimeVersion ?? ""}`.trimEnd());
-  if (typeof start.cwd === "string") console.log(`  cwd         ${start.cwd}`);
-  if (typeof start.gitBranch === "string" && start.gitBranch) console.log(`  branch      ${start.gitBranch}`);
-  console.log(`  started     ${first.ts}`);
-  console.log(`  duration    ${humanDuration(Date.parse(last.ts) - Date.parse(first.ts))}`);
-  if (meta)
-    console.log(`  imported    ${meta.importedAt}  (adapter ${meta.adapter.name}@${meta.adapter.version})`);
-
   const byType = new Map<string, number>();
   const tools = new Map<string, number>();
   for (const e of events) {
@@ -710,6 +732,47 @@ function cmdShow(opts: Opts): number {
       if (typeof name === "string") tools.set(name, (tools.get(name) ?? 0) + 1);
     }
   }
+  const u = usageTotals(events);
+
+  if (opts.json) {
+    if (opts.byModel) {
+      process.stdout.write(JSON.stringify(usageByModelJson(events), null, 2) + "\n");
+      return 0;
+    }
+    process.stdout.write(
+      JSON.stringify(
+        {
+          id,
+          runtime: typeof start.runtime === "string" ? start.runtime : null,
+          runtimeVersion: typeof start.runtimeVersion === "string" ? start.runtimeVersion : null,
+          cwd: typeof start.cwd === "string" ? start.cwd : null,
+          gitBranch: typeof start.gitBranch === "string" ? start.gitBranch : null,
+          startedAt: first.ts,
+          durationMs: Date.parse(last.ts) - Date.parse(first.ts),
+          imported: meta ? { at: meta.importedAt, adapter: meta.adapter } : null,
+          events: events.length,
+          byType: Object.fromEntries(byType),
+          tools: Object.fromEntries(tools),
+          usage: { ...u, models: [...u.models] },
+          files: [...fileStateAt(events).values()],
+          redactions: meta?.redactions ?? {},
+        },
+        null,
+        2,
+      ) + "\n",
+    );
+    return 0;
+  }
+
+  console.log(`session ${id}`);
+  console.log(`  runtime     ${start.runtime} ${start.runtimeVersion ?? ""}`.trimEnd());
+  if (typeof start.cwd === "string") console.log(`  cwd         ${start.cwd}`);
+  if (typeof start.gitBranch === "string" && start.gitBranch) console.log(`  branch      ${start.gitBranch}`);
+  console.log(`  started     ${first.ts}`);
+  console.log(`  duration    ${humanDuration(Date.parse(last.ts) - Date.parse(first.ts))}`);
+  if (meta)
+    console.log(`  imported    ${meta.importedAt}  (adapter ${meta.adapter.name}@${meta.adapter.version})`);
+
   console.log(
     `  events      ${events.length}  (${[...byType.entries()].map(([t, n]) => `${t}×${n}`).join(", ")})`,
   );
@@ -722,7 +785,6 @@ function cmdShow(opts: Opts): number {
     );
   }
 
-  const u = usageTotals(events);
   if (u.apiMessages > 0) {
     console.log(`  models      ${[...u.models].join(", ")}`);
     console.log(
@@ -758,6 +820,27 @@ function cmdShow(opts: Opts): number {
     );
   }
   return 0;
+}
+
+/** usageByModel's ModelUsage carries a Set — swap it for an array/count so JSON.stringify needs no help. */
+function usageByModelJson(events: AgitEvent[]): {
+  model: string;
+  apiMessages: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  files: string[];
+}[] {
+  return usageByModel(events).map((r) => ({
+    model: r.model,
+    apiMessages: r.apiMessages,
+    inputTokens: r.inputTokens,
+    outputTokens: r.outputTokens,
+    cacheReadInputTokens: r.cacheReadInputTokens,
+    cacheCreationInputTokens: r.cacheCreationInputTokens,
+    files: [...r.files],
+  }));
 }
 
 /**
@@ -832,6 +915,10 @@ function cmdVerify(opts: Opts): number {
     meta = readSessionMeta(opts.dir, id) ?? undefined;
   }
   const res = verifyChain(lines, meta);
+  if (opts.json) {
+    process.stdout.write(JSON.stringify({ ...res, hasMeta: meta !== undefined }, null, 2) + "\n");
+    return res.ok ? 0 : 1;
+  }
   if (res.ok) {
     console.log(
       `ok: ${res.events} events, chain intact${meta ? ", matches meta.json head" : " (no meta.json — truncation not checkable)"}`,
@@ -970,15 +1057,14 @@ function cmdDiff(opts: Opts): number {
       // about, and the same thing `agit merge` reads.
       forkSide = { tree: treeOnDisk(join(resolve(first), "tree")), label: "fork" };
     }
-    for (const line of renderDiff(
+    printDiff(
+      opts,
       diffSessions({
         a: { events: parent, label: info.sourceSession.slice(0, 8) },
         b: forkSide,
         from: { seq: info.atSeq, hash: info.atHash },
       }),
-    )) {
-      console.log(line);
-    }
+    );
     return 0;
   }
 
@@ -994,15 +1080,22 @@ function cmdDiff(opts: Opts): number {
     console.error("those are the same session");
     return 2;
   }
-  for (const line of renderDiff(
+  printDiff(
+    opts,
     diffSessions({
       a: { events: readSessionEvents(opts.dir, idA), label: idA.slice(0, 8) },
       b: { events: readSessionEvents(opts.dir, idB), label: idB.slice(0, 8) },
     }),
-  )) {
-    console.log(line);
-  }
+  );
   return 0;
+}
+
+function printDiff(opts: Opts, diff: ReturnType<typeof diffSessions>): void {
+  if (opts.json) {
+    process.stdout.write(JSON.stringify(diff, null, 2) + "\n");
+    return;
+  }
+  for (const line of renderDiff(diff)) console.log(line);
 }
 
 function cmdMerge(opts: Opts): number {
@@ -1108,6 +1201,7 @@ function cmdGrep(opts: Opts): number {
 
   const ids = listSessionIds(opts.dir);
   if (ids.length === 0) {
+    if (opts.json) return 0; // NDJSON: zero lines is zero results, nothing more to say.
     console.log("no sessions imported yet (agit import <file>)");
     return 0;
   }
@@ -1127,10 +1221,12 @@ function cmdGrep(opts: Opts): number {
       type: opts.grepType,
       path: opts.grepPath,
     })) {
-      console.log(renderHit(hit, idWidth));
+      if (opts.json) process.stdout.write(JSON.stringify(hit) + "\n");
+      else console.log(renderHit(hit, idWidth));
       total++;
     }
   }
+  if (opts.json) return total === 0 ? 1 : 0;
   if (total === 0) {
     console.error(`no matches in ${searched} session${searched === 1 ? "" : "s"}`);
     return 1;
