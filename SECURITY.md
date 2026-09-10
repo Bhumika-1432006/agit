@@ -13,7 +13,7 @@ untrusted input: agit only ever displays log content, never executes it.
 ## Reporting a vulnerability
 
 Please report vulnerabilities privately via
-[GitHub security advisories](https://github.com/thegoodengineers/agit/security/advisories/new)
+[GitHub security advisories](https://github.com/agitHQ/agit/security/advisories/new)
 rather than a public issue. Reports we especially want:
 
 - Anything that lets a crafted session log escape "displayed, never

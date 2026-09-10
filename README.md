@@ -1,6 +1,6 @@
 # agit — git for running agents
 
-[![ci](https://github.com/thegoodengineers/agit/actions/workflows/ci.yml/badge.svg)](https://github.com/thegoodengineers/agit/actions/workflows/ci.yml)
+[![ci](https://github.com/agitHQ/agit/actions/workflows/ci.yml/badge.svg)](https://github.com/agitHQ/agit/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/agitsh)](https://www.npmjs.com/package/agitsh)
 
 An AI coding session is trapped: one terminal, one machine, a proprietary log
@@ -31,7 +31,7 @@ npm install -g agitsh
 Or, for contributors, from source:
 
 ```
-git clone https://github.com/thegoodengineers/agit && cd agit
+git clone https://github.com/agitHQ/agit && cd agit
 npm ci && npm run build && npm link   # `agit` is now on your PATH
 ```
 
@@ -54,11 +54,25 @@ npm ci && npm run build && npm link   # `agit` is now on your PATH
   Deterministic: the same input always produces byte-identical output.
   Credential-looking strings are redacted on the way in (see
   [SPEC.md section 8](SPEC.md) for exactly what is and isn't caught).
+  `--no-redact` stores a session verbatim when redaction would mangle it;
+  `share`, `pr` and `export-html` then refuse that session until you pass
+  `--allow-unredacted`, and re-importing without the flag puts redaction back.
 - **`agit ls`** — list imported sessions: start, duration, events, files touched.
 - **`agit show <id>`** — one-session summary: model, tools, token totals,
   per-file diffstat. `--by-model` splits it: what each model cost and how
   many files its edits touched. Tokens are exact; file attribution credits
   an edit to the model named by the nearest preceding event, and says so.
+- **`agit rm <id> --yes`** — delete a session from the store. `--yes` is the
+  confirmation: there is no interactive prompt for a script to answer, so the
+  flag is it. Without it, `rm` says what it would remove and stops. It does
+  not know whether a fork somewhere still points at the session — forks live
+  wherever `--out` put them, with no registry to consult — and says so rather
+  than guessing.
+- **`agit stats`** — token and API-call totals across every imported
+  session, grouped `--by model` (default) or `--by runtime`. A fold over the
+  `cost` events each session already carries, so it needs no new data — and
+  it says how many sessions it could not read rather than quietly leaving
+  them out. `--json` for scripts.
 - **`agit grep <pattern>`** — search every imported session at once:
   "which session touched auth.py" (`--path`), "where did I run pytest"
   (`--type tool.call`). Matches the same one-line rendering `replay
@@ -112,6 +126,12 @@ npm ci && npm run build && npm link   # `agit` is now on your PATH
   loopback by default, nothing persisted. [PROTOCOL.md](PROTOCOL.md)
   documents the (v0, unstable) wire protocol.
 
+**`--json`** on `ls`, `show`, `show --by-model`, `verify`, `grep`, `diff`
+and `export` emits the structures agit already builds, so a script reads
+the same numbers the table renders — full ids, ISO timestamps, real
+integers. `grep --json` is one object per line (NDJSON); everything else
+is one document. Errors stay on stderr, so a pipe into `jq` is always clean.
+
 Session ids accept unique prefixes, git-style. The inspection verbs are
 fully local: no server, no network calls, no telemetry. Only `share` talks
 to a relay — one you run.
@@ -130,13 +150,16 @@ fall out of that chain.
 
 Said plainly:
 
-- **Two adapters, with different limits.** Claude Code is the reference;
-  Codex is mapped from its own structured edit records. OpenClaw is next.
+- **Three adapters, with different limits.** Claude Code is the reference;
+  Codex is mapped from its own structured edit records. OpenClaw is mapped from the `apply_patch` text it records, replayed
+  with OpenClaw's own matching rules.
 - **Codex updates have a verification window.** Codex records a file's full
   content when it *creates* one, but only a diff when it *updates* one — so
   agit can verify an update only while it already holds that file's content
   from earlier in the same session. An edit to a file that predates the
   session is skipped and counted, never hashed on a guess.
+- **OpenClaw has the same window**: `apply_patch` records the patch, not
+  the file, so an update is verifiable only for a file the session created.
 - **Codex renames are skipped** — no event type says so. Deletions are
   recorded (`file.delete`) whenever Codex logged the file's content.
 - **Codex reasoning arrives encrypted** and is dropped, counted.

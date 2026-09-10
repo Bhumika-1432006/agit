@@ -66,7 +66,7 @@ I trust the format enough to show it to you.
     agit import ~/.claude/projects/<project>/<session>.jsonl
     agit replay <id> --timeline
 
-https://github.com/thegoodengineers/agit
+https://github.com/agitHQ/agit
 
 I'd especially value: real session logs that break the adapters (fixing the
 adapter, not the fixture, is a repo rule), and anyone running OpenClaw —
@@ -83,7 +83,7 @@ agit turns it into a git-like artifact: an append-only, hash-chained event
 log you can replay, verify, fork, and live-share.
 
 npm i -g agitsh
-github.com/thegoodengineers/agit
+github.com/agitHQ/agit
 
 **2/**
 The feature I didn't plan: because every file edit records content hashes,
@@ -137,4 +137,4 @@ Two runtime adapters (Claude Code, Codex CLI), zero runtime dependencies,
 Apache-2.0, and a README that says plainly what doesn't work. Would love
 real logs that break the adapters.
 
-https://github.com/thegoodengineers/agit
+https://github.com/agitHQ/agit
