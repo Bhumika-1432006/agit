@@ -115,6 +115,12 @@ npm ci && npm run build && npm link   # `agit` is now on your PATH
   loopback by default, nothing persisted. [PROTOCOL.md](PROTOCOL.md)
   documents the (v0, unstable) wire protocol.
 
+**`--json`** on `ls`, `show`, `show --by-model`, `verify`, `grep`, `diff`
+and `export` emits the structures agit already builds, so a script reads
+the same numbers the table renders — full ids, ISO timestamps, real
+integers. `grep --json` is one object per line (NDJSON); everything else
+is one document. Errors stay on stderr, so a pipe into `jq` is always clean.
+
 Session ids accept unique prefixes, git-style. The inspection verbs are
 fully local: no server, no network calls, no telemetry. Only `share` talks
 to a relay — one you run.
