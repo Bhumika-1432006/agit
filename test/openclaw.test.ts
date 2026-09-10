@@ -4,7 +4,9 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { claudeCodeAdapter } from "../src/adapters/claude-code.js";
 import { codexAdapter } from "../src/adapters/codex.js";
-import { buildChain } from "../src/format/hash.js";
+import { createHash } from "node:crypto";
+import { buildChain, toJsonl } from "../src/format/hash.js";
+import { reconstructTree } from "../src/fork.js";
 import { timelineLines } from "../src/state.js";
 import { openclawAdapter } from "../src/adapters/openclaw.js";
 import type { DraftEvent, Json } from "../src/format/events.js";
@@ -52,7 +54,7 @@ describe("openclaw adapter", () => {
     expect(start.cwd).toBe("/workspace/demo");
     expect(start.adapter).toEqual({
       name: "openclaw",
-      version: "0.1.0",
+      version: "0.2.0",
     });
   });
 
@@ -192,5 +194,78 @@ describe("openclaw adapter", () => {
       "message:system": 1,
     });
     expect(res.drafts.map((d) => d.type)).toEqual(["session.start", "session.end"]);
+  });
+});
+
+describe("apply_patch → file events (fixtures/openclaw/edits.jsonl)", () => {
+  const editLines = readFileSync(join(ROOT, "fixtures", "openclaw", "edits.jsonl"), "utf8")
+    .split("\n")
+    .filter((l) => l.trim() !== "");
+  const res = openclawAdapter.convert(editLines);
+  const events = buildChain(res.sessionId, res.drafts);
+  const fileEvents = res.drafts.filter((d) => d.type === "file.diff" || d.type === "file.delete");
+  const pay = (d: DraftEvent): { [k: string]: Json } => d.payload as { [k: string]: Json };
+  const sha = (s: string): string => createHash("sha256").update(s, "utf8").digest("hex");
+
+  it("maps add, update, EOF append, delete, rename and a multi-file patch, in patch order", () => {
+    expect(fileEvents.map((d) => [d.type, pay(d).kind ?? "delete", pay(d).path])).toEqual([
+      ["file.diff", "create", "/workspace/demo/hello.py"],
+      ["file.diff", "modify", "/workspace/demo/hello.py"],
+      ["file.diff", "create", "/workspace/demo/notes.md"],
+      ["file.diff", "modify", "/workspace/demo/notes.md"],
+      ["file.delete", "delete", "/workspace/demo/hello.py"],
+      ["file.delete", "delete", "/workspace/demo/notes.md"],
+      ["file.diff", "create", "/workspace/demo/docs/notes.md"],
+      ["file.diff", "create", "/workspace/demo/z.py"],
+      ["file.diff", "create", "/workspace/demo/a.py"],
+    ]);
+  });
+
+  it("hashes exactly the bytes OpenClaw wrote, update rules included", () => {
+    const [create, modify, , eofAppend, , , renamed] = fileEvents;
+    expect(pay(create!).afterHash).toBe(sha("def hello():\n    print('hi')\n"));
+    expect(pay(modify!).beforeHash).toBe(sha("def hello():\n    print('hi')\n"));
+    expect(pay(modify!).afterHash).toBe(sha("def hello():\n    print('hello, world')\n"));
+    expect(pay(eofAppend!).afterHash).toBe(sha("# notes\n\n- shipped\n- tested\n"));
+    expect(pay(renamed!).afterHash).toBe(sha("# Notes\n\n- shipped\n- tested\n"));
+    expect(pay(fileEvents[5]!).beforeHash).toBe(sha("# notes\n\n- shipped\n- tested\n"));
+  });
+
+  it("skips what it cannot vouch for, and says which", () => {
+    expect(res.skipped).toMatchObject({
+      "apply_patch:update(base content not in log)": 1, // existing.py predates the session
+      "apply_patch:failed(nothing attributed)": 1,
+      "apply_patch:no-op": 1,
+      "apply_patch:unparseable input": 1,
+    });
+  });
+
+  it("every file event follows the tool.result that confirmed it", () => {
+    for (const [i, d] of res.drafts.entries()) {
+      if (d.type !== "file.diff" && d.type !== "file.delete") continue;
+      const before = res.drafts
+        .slice(0, i)
+        .reverse()
+        .find((x) => x.type === "tool.result")!;
+      expect(pay(before).toolUseId).toBe(pay(d).toolUseId);
+    }
+  });
+
+  it("the reconstructed tree is what the session left behind", () => {
+    const { files, skipped } = reconstructTree(events, events.length - 1);
+    expect(skipped).toEqual([]);
+    expect(files.map((f) => f.path).sort()).toEqual([
+      "/workspace/demo/a.py",
+      "/workspace/demo/docs/notes.md",
+      "/workspace/demo/z.py",
+    ]);
+    expect(files.find((f) => f.path.endsWith("docs/notes.md"))!.content).toBe(
+      "# Notes\n\n- shipped\n- tested\n",
+    );
+  });
+
+  it("imports byte-identically", () => {
+    const again = openclawAdapter.convert(editLines);
+    expect(toJsonl(buildChain(again.sessionId, again.drafts))).toBe(toJsonl(events));
   });
 });
