@@ -54,9 +54,6 @@ npm ci && npm run build && npm link   # `agit` is now on your PATH
   Deterministic: the same input always produces byte-identical output.
   Credential-looking strings are redacted on the way in (see
   [SPEC.md section 8](SPEC.md) for exactly what is and isn't caught).
-  `--no-redact` stores a session verbatim when redaction would mangle it;
-  `share`, `pr` and `export-html` then refuse that session until you pass
-  `--allow-unredacted`, and re-importing without the flag puts redaction back.
 - **`agit ls`** — list imported sessions: start, duration, events, files touched.
 - **`agit show <id>`** — one-session summary: model, tools, token totals,
   per-file diffstat. `--by-model` splits it: what each model cost and how

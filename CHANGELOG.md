@@ -3,21 +3,6 @@
 Notable changes to agit. The event format itself is versioned separately
 (SPEC.md §11); a spec bump is always called out here in bold.
 
-## Unreleased
-
-### Added
-
-- **`agit import --no-redact`** (#70) stores a session verbatim when the
-  credential patterns would mangle content you need intact. `meta.json`
-  records that the scan was skipped, and `share`, `pr` and `export-html`
-  refuse such a session until `--allow-unredacted` says you have read it
-  yourself. Adopting a bundle from a `--no-redact` origin says so plainly —
-  the recipient has the least context and adoption is the one moment agit
-  speaks to them. Re-importing the same file with the mode flipped now
-  actually re-imports: the "already imported" check compares redaction mode
-  as well as the source bytes, so re-importing without the flag is the cure
-  for an accidental `--no-redact` rather than a no-op that reports success.
-
 ## 0.5.0 — 2026-09-09
 
 ### Changed
