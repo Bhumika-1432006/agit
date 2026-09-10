@@ -7,6 +7,13 @@ Notable changes to agit. The event format itself is versioned separately
 
 ### Added
 
+- **`agit stats`** (#67) — usage across the whole store, grouped `--by
+  model` (default) or `--by runtime`, with `--json`. A fold over the `cost`
+  events sessions already carry: no new event types, nothing recorded that
+  was not already there. A runtime that logs no cost events shows as zeros
+  rather than being dropped, and unreadable sessions are counted and named
+  in the output instead of silently narrowing the totals. No `--since`
+  window and no price table yet; both are still open on #67.
 - **`--json` on every read verb** (#73): `ls`, `show`, `show --by-model`,
   `verify`, `grep` and `diff` emit the structures the code already builds —
   full session ids, ISO timestamps and real numbers rather than the padded

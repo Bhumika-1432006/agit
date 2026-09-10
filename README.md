@@ -62,6 +62,11 @@ npm ci && npm run build && npm link   # `agit` is now on your PATH
   per-file diffstat. `--by-model` splits it: what each model cost and how
   many files its edits touched. Tokens are exact; file attribution credits
   an edit to the model named by the nearest preceding event, and says so.
+- **`agit stats`** — token and API-call totals across every imported
+  session, grouped `--by model` (default) or `--by runtime`. A fold over the
+  `cost` events each session already carries, so it needs no new data — and
+  it says how many sessions it could not read rather than quietly leaving
+  them out. `--json` for scripts.
 - **`agit grep <pattern>`** — search every imported session at once:
   "which session touched auth.py" (`--path`), "where did I run pytest"
   (`--type tool.call`). Matches the same one-line rendering `replay
