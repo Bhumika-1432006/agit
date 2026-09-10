@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -110,5 +110,98 @@ describe("agit import --no-redact", () => {
     const r = agit(["share", "fixture-simple-0001", "--static", "--dir", store]);
     expect(r.code).toBe(1);
     expect(r.out).toContain("never scanned for credentials");
+  });
+});
+
+describe("switching redaction mode on an already-imported file", () => {
+  // The dedupe that makes `import --all` cheap keys on the source file's
+  // sha256. --no-redact makes the stored output depend on a flag as well, so
+  // without this the store's redaction state freezes at whatever the first
+  // import happened to use — and the obvious remedy reports success while
+  // changing nothing.
+  it("re-importing without the flag actually undoes an accidental --no-redact", () => {
+    const store = freshStore();
+    expect(agit(["import", SIMPLE, "--no-redact", "--dir", store]).out).toContain("SKIPPED (--no-redact)");
+    const metaPath = join(store, ".agit", "sessions", "fixture-simple-0001", "meta.json");
+    const logPath = join(store, ".agit", "sessions", "fixture-simple-0001", "events.jsonl");
+    expect(readFileSync(logPath, "utf8")).not.toContain("[REDACTED:");
+    expect(JSON.parse(readFileSync(metaPath, "utf8")).redactionSkipped).toBe(true);
+
+    const cure = agit(["import", SIMPLE, "--dir", store]);
+    expect(cure.code).toBe(0);
+    expect(cure.out).not.toContain("nothing to do");
+    expect(cure.out).toContain("redaction was OFF (--no-redact) for the stored copy; it is now ON");
+    expect(readFileSync(logPath, "utf8")).toContain("[REDACTED:");
+    expect(JSON.parse(readFileSync(metaPath, "utf8")).redactionSkipped).toBeUndefined();
+  });
+
+  it("--no-redact on an already-redacted session takes effect instead of no-opping", () => {
+    const store = freshStore();
+    agit(["import", SIMPLE, "--dir", store]);
+    const logPath = join(store, ".agit", "sessions", "fixture-simple-0001", "events.jsonl");
+    expect(readFileSync(logPath, "utf8")).toContain("[REDACTED:");
+
+    const again = agit(["import", SIMPLE, "--no-redact", "--dir", store]);
+    expect(again.code).toBe(0);
+    expect(again.out).toContain("redaction was ON for the stored copy; it is now OFF");
+    expect(readFileSync(logPath, "utf8")).not.toContain("[REDACTED:");
+  });
+
+  it("a re-import with the SAME mode is still the cheap no-op import --all relies on", () => {
+    const store = freshStore();
+    agit(["import", SIMPLE, "--dir", store]);
+    const before = readFileSync(join(store, ".agit", "sessions", "fixture-simple-0001", "meta.json"), "utf8");
+    const again = agit(["import", SIMPLE, "--dir", store]);
+    expect(again.out).toContain("nothing to do");
+    expect(readFileSync(join(store, ".agit", "sessions", "fixture-simple-0001", "meta.json"), "utf8")).toBe(
+      before,
+    );
+
+    const skipped = freshStore();
+    agit(["import", SIMPLE, "--no-redact", "--dir", skipped]);
+    expect(agit(["import", SIMPLE, "--no-redact", "--dir", skipped]).out).toContain("nothing to do");
+  });
+});
+
+describe("handing an unredacted session onward", () => {
+  it("export-html refuses it, like pr and share", () => {
+    const store = freshStore();
+    agit(["import", SIMPLE, "--no-redact", "--dir", store]);
+    const out = join(store, "page.html");
+    const r = agit(["export-html", "fixture-simple-0001", "--out", out, "--dir", store]);
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("never scanned for credentials");
+    expect(existsSync(out)).toBe(false);
+
+    const allowed = agit([
+      "export-html",
+      "fixture-simple-0001",
+      "--out",
+      out,
+      "--allow-unredacted",
+      "--dir",
+      store,
+    ]);
+    expect(allowed.code).toBe(0);
+    expect(existsSync(out)).toBe(true);
+  });
+
+  it("adopting a bundle from a --no-redact origin tells the recipient it was never scanned", () => {
+    const origin = freshStore();
+    agit(["import", SIMPLE, "--no-redact", "--dir", origin]);
+    const bundle = join(origin, "bundle");
+    expect(
+      agit(["pr", "fixture-simple-0001", "--out", bundle, "--allow-unredacted", "--dir", origin]).code,
+    ).toBe(0);
+
+    const recipient = freshStore();
+    const adopted = agit(["import", bundle, "--dir", recipient]);
+    expect(adopted.code).toBe(0);
+    // The recipient has the least context; silence here would read as "scanned, nothing found".
+    expect(adopted.out).toContain("never scanned for credentials");
+    // And the marker still travels, so their own share/pr stays gated.
+    expect(agit(["pr", "fixture-simple-0001", "--out", join(recipient, "b2"), "--dir", recipient]).code).toBe(
+      1,
+    );
   });
 });

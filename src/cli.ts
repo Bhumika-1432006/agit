@@ -320,12 +320,20 @@ function refuseUnlessRedacted(opts: Opts, id: string, verb: string): boolean {
   return false;
 }
 
+/** A session already in the store, and the redaction mode it was imported under. */
+interface KnownSource {
+  id: string;
+  noRedact: boolean;
+}
+
 interface ImportOutcome {
   status: "imported" | "updated" | "unchanged" | "unrecognized";
   id?: string;
   adapter?: Adapter;
   events?: number;
   previousEvents?: number;
+  /** True when this re-import flipped --no-redact on or off for an already-stored session. */
+  modeChanged?: boolean;
   records?: number;
   skipped?: Record<string, number>;
   redactions?: RedactionCounts;
@@ -337,11 +345,13 @@ interface ImportOutcome {
  * a log is already in the store. Import is deterministic, so a matching hash
  * means byte-identical output and nothing to do.
  */
-function knownSources(dir: string): Map<string, string> {
-  const known = new Map<string, string>();
+function knownSources(dir: string): Map<string, KnownSource> {
+  const known = new Map<string, KnownSource>();
   for (const id of listSessionIds(dir)) {
     const meta = readSessionMeta(dir, id);
-    if (meta?.source?.sha256) known.set(meta.source.sha256, id);
+    if (meta?.source?.sha256) {
+      known.set(meta.source.sha256, { id, noRedact: meta.redactionSkipped === true });
+    }
   }
   return known;
 }
@@ -352,11 +362,18 @@ function importNativeLog(
   path: string,
   raw: string,
   lines: string[],
-  known: Map<string, string>,
+  known: Map<string, KnownSource>,
 ): ImportOutcome {
   const sha256 = sha256Hex(raw);
-  const knownId = known.get(sha256);
-  if (knownId !== undefined) return { status: "unchanged", id: knownId };
+  const hit = known.get(sha256);
+  // The source bytes alone stopped being a complete identity the moment
+  // --no-redact made the stored output depend on a flag too. Re-import when
+  // the requested mode differs from the stored one, so that re-importing
+  // without the flag is the cure for an accidental --no-redact rather than a
+  // no-op that reports success.
+  if (hit !== undefined && hit.noRedact === opts.noRedact) {
+    return { status: "unchanged", id: hit.id };
+  }
 
   const adapter = ADAPTERS.find((a) => a.detect(lines));
   if (!adapter) return { status: "unrecognized" };
@@ -371,6 +388,10 @@ function importNativeLog(
   const previous = listSessionIds(opts.dir).includes(converted.sessionId)
     ? readSessionMeta(opts.dir, converted.sessionId)
     : null;
+  // Same bytes, different mode: the user is switching redaction on or off,
+  // which is the one case where "updated N -> N events" would read as a
+  // no-op when it is in fact a full rewrite of the stored payloads.
+  const modeChanged = previous !== null && (previous.redactionSkipped === true) !== opts.noRedact;
 
   const meta: SessionMeta = {
     agitSchema: SCHEMA_VERSION,
@@ -385,10 +406,11 @@ function importNativeLog(
     ...(opts.noRedact ? { redactionSkipped: true as const } : {}),
   };
   writeSession(opts.dir, converted.sessionId, toJsonl(events), meta);
-  known.set(sha256, converted.sessionId);
+  known.set(sha256, { id: converted.sessionId, noRedact: opts.noRedact });
   return {
     status: previous ? "updated" : "imported",
     id: converted.sessionId,
+    modeChanged,
     adapter,
     events: events.length,
     previousEvents: previous?.eventCount,
@@ -422,6 +444,13 @@ function printImportReport(opts: Opts, outcome: ImportOutcome): number {
       ? `  events      ${outcome.previousEvents} → ${outcome.events} (from ${outcome.records} native records)`
       : `  events      ${outcome.events} (from ${outcome.records} native records)`,
   );
+  if (outcome.modeChanged === true) {
+    console.log(
+      opts.noRedact
+        ? "  re-imported  redaction was ON for the stored copy; it is now OFF (--no-redact)"
+        : "  re-imported  redaction was OFF (--no-redact) for the stored copy; it is now ON",
+    );
+  }
   const skippedTotal = Object.values(skipped).reduce((a, b) => a + b, 0);
   if (skippedTotal > 0) {
     const detail = Object.entries(skipped)
@@ -656,11 +685,21 @@ function adoptBundle(opts: Opts, path: string, raw: string): number {
   console.log(`  events      ${res.events}, chain intact${meta ? ", matches meta.json head" : ""}`);
   if (meta) {
     console.log(`  origin      ${meta.adapter.name}@${meta.adapter.version}, imported ${meta.importedAt}`);
-    const redacted = Object.entries(meta.redactions);
-    if (redacted.length > 0) {
+    // The recipient has the least context about how this log was produced,
+    // and adoption is the one moment agit speaks to them. A --no-redact
+    // origin leaves `redactions` empty, so silence here would read as
+    // "scanned, nothing found" — the opposite of what happened.
+    if (meta.redactionSkipped) {
       console.log(
-        `  redactions  ${redacted.map(([k, v]) => `${k}×${v}`).join(", ")} (applied at the origin; agit did not re-scan)`,
+        "  redactions  NONE — the origin imported with --no-redact, so this log was never scanned for credentials (agit did not re-scan either)",
       );
+    } else {
+      const redacted = Object.entries(meta.redactions);
+      if (redacted.length > 0) {
+        console.log(
+          `  redactions  ${redacted.map(([k, v]) => `${k}×${v}`).join(", ")} (applied at the origin; agit did not re-scan)`,
+        );
+      }
     }
   } else {
     console.log("  meta        none in the bundle — truncation is not checkable for this session");
@@ -1190,6 +1229,11 @@ function cmdExportHtml(opts: Opts): number {
   const id = requireId(opts);
   const meta = readSessionMeta(opts.dir, id);
   if (!refuseUnlessVerified(opts, id, "export", "nothing was written")) return 1;
+  // A self-contained page exists to be handed to someone else, the same as a
+  // `pr` bundle — so it takes the same gate. `export` to stdout deliberately
+  // does not: it is how you read a session to decide whether it is safe, and
+  // the refusal itself tells you to go and check.
+  if (!refuseUnlessRedacted(opts, id, "export")) return 1;
 
   const all = readSessionEvents(opts.dir, id);
   if (opts.at !== undefined && (!Number.isInteger(opts.at) || opts.at < 0 || opts.at >= all.length)) {
