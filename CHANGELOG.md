@@ -7,6 +7,18 @@ Notable changes to agit. The event format itself is versioned separately
 
 ### Added
 
+- **`--json` on every read verb** (#73): `ls`, `show`, `show --by-model`,
+  `verify`, `grep` and `diff` emit the structures the code already builds —
+  full session ids, ISO timestamps and real numbers rather than the padded
+  display strings — so what a script reads is what the table renders.
+  `grep --json` is NDJSON, one hit per line; everything else is one
+  document. Exit codes and human output are unchanged, and errors stay on
+  stderr so a pipe into `jq` is always clean. `ls --json` reports
+  `readable` rather than a `corrupt` flag that never consults the hash
+  chain, and carries the reason when a log cannot be read; `show --json`
+  reports `redactionSkipped`, because a `--no-redact` import also leaves
+  `redactions` empty and a consumer gating on it needs to tell the two
+  apart.
 - **`agit import --no-redact`** (#70) stores a session verbatim when the
   credential patterns would mangle content you need intact. `meta.json`
   records that the scan was skipped, and `share`, `pr` and `export-html`

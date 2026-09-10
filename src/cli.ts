@@ -714,7 +714,15 @@ function adoptBundle(opts: Opts, path: string, raw: string): number {
 
 interface LsRow {
   id: string;
-  corrupt: boolean;
+  /**
+   * Whether the stored log parses back into events — nothing more. `ls` does
+   * not verify the hash chain (`agit verify` does), so a tampered log that
+   * still parses is `readable: true`. Named for what it measures: a field
+   * called `corrupt: false` would read as an integrity claim this never makes.
+   */
+  readable: boolean;
+  /** Why the log could not be read, when readable is false. */
+  reason?: string;
   started?: string;
   durationMs?: number;
   events?: number;
@@ -739,8 +747,8 @@ function cmdLs(opts: Opts): number {
     try {
       events = readSessionEvents(opts.dir, id);
       if (events.length === 0) throw new Error("empty log");
-    } catch {
-      return { id, corrupt: true };
+    } catch (err) {
+      return { id, readable: false, reason: err instanceof Error ? err.message : String(err) };
     }
     const first = events[0]!;
     const last = events[events.length - 1]!;
@@ -748,7 +756,7 @@ function cmdLs(opts: Opts): number {
     const start = (first.payload as { runtime?: unknown }).runtime;
     return {
       id,
-      corrupt: false,
+      readable: true,
       started: first.ts,
       durationMs: Date.parse(last.ts) - Date.parse(first.ts),
       events: events.length,
@@ -761,7 +769,7 @@ function cmdLs(opts: Opts): number {
     return 0;
   }
   const displayRows = rows.map((r) =>
-    r.corrupt
+    !r.readable
       ? {
           id: r.id.slice(0, 8),
           started: "(corrupt — run `agit verify " + r.id.slice(0, 8) + "`)",
@@ -828,6 +836,10 @@ function cmdShow(opts: Opts): number {
           usage: { ...u, models: [...u.models] },
           files: [...fileStateAt(events).values()],
           redactions: meta?.redactions ?? {},
+          // {} alone is ambiguous: a --no-redact import (#79) also leaves it
+          // empty, so a consumer gating on redaction needs this to tell
+          // "scanned, found nothing" from "never scanned".
+          redactionSkipped: meta?.redactionSkipped === true,
         },
         null,
         2,

@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -40,10 +40,10 @@ describe("--json on read verbs", () => {
   it("ls --json: an array of session rows, full ids and numeric fields", () => {
     const r = agit(["ls", "--json", "--dir", store]);
     expect(r.code).toBe(0);
-    const rows = JSON.parse(r.out) as { id: string; corrupt: boolean; events: number; runtime: string }[];
+    const rows = JSON.parse(r.out) as { id: string; readable: boolean; events: number; runtime: string }[];
     expect(rows).toHaveLength(2);
     const simple = rows.find((row) => row.id === "fixture-simple-0001")!;
-    expect(simple.corrupt).toBe(false);
+    expect(simple.readable).toBe(true);
     expect(simple.runtime).toBe("claude-code");
     expect(simple.events).toBe(18);
   });
@@ -135,5 +135,60 @@ describe("--json on read verbs", () => {
     expect(doc.a.label).toBe("fixture-");
     expect(doc.b.label).toBe("demo-rat");
     expect(doc.files.some((f) => f.path === "hello.ts" && f.verdict === "only-a")).toBe(true);
+  });
+});
+
+describe("--json carries what the human output states in prose", () => {
+  it("show --json distinguishes 'never scanned' from 'scanned, found nothing'", () => {
+    // --no-redact (#79) leaves `redactions` empty, so {} alone is ambiguous —
+    // and it is exactly the field a script would gate publishing on.
+    const skipped = mkdtempSync(join(tmpdir(), "agit-json-skip-"));
+    agit(["import", SIMPLE, "--no-redact", "--dir", skipped]);
+    const a = JSON.parse(agit(["show", "fixture-simple-0001", "--json", "--dir", skipped]).out) as {
+      redactions: Record<string, number>;
+      redactionSkipped: boolean;
+    };
+    expect(a.redactions).toEqual({});
+    expect(a.redactionSkipped).toBe(true);
+
+    const scanned = mkdtempSync(join(tmpdir(), "agit-json-scan-"));
+    agit(["import", SIMPLE, "--dir", scanned]);
+    const b = JSON.parse(agit(["show", "fixture-simple-0001", "--json", "--dir", scanned]).out) as {
+      redactionSkipped: boolean;
+    };
+    expect(b.redactionSkipped).toBe(false);
+  });
+
+  it("ls --json says whether the log is readable, and why not when it isn't", () => {
+    const store = mkdtempSync(join(tmpdir(), "agit-json-unreadable-"));
+    agit(["import", SIMPLE, "--dir", store]);
+    writeFileSync(
+      join(store, ".agit", "sessions", "fixture-simple-0001", "events.jsonl"),
+      "{not json\n",
+      "utf8",
+    );
+    const rows = JSON.parse(agit(["ls", "--json", "--dir", store]).out) as {
+      id: string;
+      readable: boolean;
+      reason?: string;
+    }[];
+    expect(rows[0]!.readable).toBe(false);
+    // A bare boolean cannot tell an empty log from unparseable JSON from a
+    // log written by a newer agit; the reason can.
+    expect(rows[0]!.reason).toBeTruthy();
+  });
+
+  it("ls --json does not claim the chain is intact — that is agit verify's job", () => {
+    const store = mkdtempSync(join(tmpdir(), "agit-json-tampered-"));
+    agit(["import", SIMPLE, "--dir", store]);
+    const log = join(store, ".agit", "sessions", "fixture-simple-0001", "events.jsonl");
+    writeFileSync(log, readFileSync(log, "utf8").replace("hello", "HELLO"), "utf8");
+    // The log still parses, so ls reports it readable. `readable` is named for
+    // exactly that, and verify is the verb that speaks to the chain.
+    const rows = JSON.parse(agit(["ls", "--json", "--dir", store]).out) as { readable: boolean }[];
+    expect(rows[0]!.readable).toBe(true);
+    const v = agit(["verify", "fixture-simple-0001", "--json", "--dir", store]);
+    expect(v.code).toBe(1);
+    expect(JSON.parse(v.out).ok).toBe(false);
   });
 });
